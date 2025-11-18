@@ -56,6 +56,12 @@ public static class GeminiPromptBuilder
 			"Output Format (MUST BE JSON):\n" +
 			"당신은 반드시 [Step 1]과 [Step 2]의 결과를 결합하여, 아래와 같은 JSON 형식으로만 응답해야 합니다.\n" +
 			"다른 설명이나 마크다운 코드블록(```json)은 절대 포함하지 마세요. 순수 JSON만 출력하세요.\n\n" +
+			"**중요**: 'state_update' 필드에 플레이어의 선택이나 사건의 결과로 변경된 게임 상태를 반영하세요.\n" +
+			"- resources: 자원 변화 (food는 0~99 범위)\n" +
+			"- stability: 안정성 변화 (stability는 0~100 범위, 상황에 따라 적절한 이름으로 표현)\n" +
+			"- factionTrust: 동적 세력별 신뢰도 변화 (최대 3개 그룹, 각 0~100 범위)\n" +
+			"  * 세력 이름은 상황에 맞게 자유롭게 설정 (예: \"생존자\", \"군인\", \"피난민\", \"자원봉사자\" 등)\n" +
+			"  * 중요한 그룹만 포함 (1~3개), 매번 다를 수 있음\n\n" +
 			"{\n" +
 			"  \"situation_text\": \"(Step 1에서 생성한 상황 묘사 텍스트)\",\n" +
 			"  \"choices\": [\n" +
@@ -63,7 +69,22 @@ public static class GeminiPromptBuilder
 			"    \"(Step 2에서 생성한 선택지 2)\",\n" +
 			"    \"(Step 2에서 생성한 선택지 3)\",\n" +
 			"    \"(Step 2에서 생성한 선택지 4)\"\n" +
-			"  ]\n" +
+			"  ],\n" +
+			"  \"state_update\": {\n" +
+			"    \"resources\": {\n" +
+			"      \"food\": 18\n" +
+			"    },\n" +
+			"    \"stability\": {\n" +
+			"      \"stability\": 65\n" +
+			"    },\n" +
+			"    \"factionTrust\": {\n" +
+			"      \"factions\": [\n" +
+			"        { \"name\": \"생존자\", \"trust\": 70 },\n" +
+			"        { \"name\": \"군인\", \"trust\": 45 },\n" +
+			"        { \"name\": \"피난민\", \"trust\": 60 }\n" +
+			"      ]\n" +
+			"    }\n" +
+			"  }\n" +
 			"}\n" +
 			"---\n\n" +
 			"Input GameState:\n" +
