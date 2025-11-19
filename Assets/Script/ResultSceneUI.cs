@@ -1,8 +1,9 @@
 using UnityEngine;
 using TMPro;
 using UnityEngine.UI;
-using GenerativeAI;
-using System.Threading.Tasks;
+using UnityEngine.Networking;
+using System.Collections;
+using System.Text;
 
 /// <summary>
 /// 게임 결산 씬 UI 관리
@@ -35,29 +36,11 @@ public class ResultSceneUI : MonoBehaviour
     public GameObject loadingPanel;
 
     private GameState _finalGameState;
-    private GenerativeModel _flashModel;
+    private const string BaseUrl = "https://generativelanguage.googleapis.com/v1beta/models/";
+    private const string ModelName = "gemini-2.5-flash-lite";
 
-    private async void Start()
+    private void Start()
     {
-        // 로딩 패널 표시
-        if (loadingPanel != null)
-        {
-            loadingPanel.SetActive(true);
-        }
-
-        // Gemini API 초기화
-        if (string.IsNullOrEmpty(apiKey.apiKey))
-        {
-            Debug.LogError("ResultSceneUI: API 키가 비어 있습니다.");
-            if (summaryText != null)
-                summaryText.text = "오류: API 키가 설정되지 않았습니다.";
-            if (loadingPanel != null)
-                loadingPanel.SetActive(false);
-            return;
-        }
-
-        _flashModel = new GenerativeModel(apiKey.apiKey, "gemini-2.5-flash-lite");
-
         // PlayerPrefs에서 최종 게임 상태 로드
         string gameStateJson = PlayerPrefs.GetString("FinalGameState", "");
         
@@ -73,19 +56,36 @@ public class ResultSceneUI : MonoBehaviour
 
         _finalGameState = JsonUtility.FromJson<GameState>(gameStateJson);
         
-        // 비동기 메서드 호출 (await 없이 Task 반환)
-        _ = DisplayResults();
+        // 결과 표시 시작
+        StartCoroutine(DisplayResultsCoroutine());
     }
 
     /// <summary>
     /// 최종 결과 표시
     /// </summary>
-    private async Task DisplayResults()
+    private IEnumerator DisplayResultsCoroutine()
     {
-        if (_finalGameState == null) return;
+        if (_finalGameState == null) yield break;
 
-        // 생존 성공 여부 판단
-        bool survived = _finalGameState.stability.stability >= 30;
+        // 로딩 패널 표시
+        if (loadingPanel != null)
+        {
+            loadingPanel.SetActive(true);
+        }
+
+        // Gemini API 초기화 체크
+        if (string.IsNullOrEmpty(apiKey.apiKey))
+        {
+            Debug.LogError("ResultSceneUI: API 키가 비어 있습니다.");
+            if (summaryText != null)
+                summaryText.text = "오류: API 키가 설정되지 않았습니다.";
+            if (loadingPanel != null)
+                loadingPanel.SetActive(false);
+            yield break;
+        }
+
+        // 생존 성공 여부 판단 (안정성이 0보다 크면 성공)
+        bool survived = _finalGameState.stability.stability > 0;
 
         // 안정도
         if (finalStabilitySlider != null)
@@ -98,36 +98,46 @@ public class ResultSceneUI : MonoBehaviour
         }
 
         // AI로 제목과 요약 생성
-        try
-        {
-            // 제목 생성
-            if (resultTitleText != null)
-            {
-                string aiTitle = await GenerateAITitle(survived);
-                resultTitleText.text = aiTitle;
-                resultTitleText.color = survived ? Color.green : Color.red;
-            }
+        bool titleGenerated = false;
+        bool summaryGenerated = false;
 
-            // 요약 생성
-            if (summaryText != null)
-            {
-                string aiSummary = await GenerateAISummary(survived);
-                summaryText.text = aiSummary;
-            }
-        }
-        catch (System.Exception e)
+        // 제목 생성
+        if (resultTitleText != null)
         {
-            Debug.LogError($"AI 생성 실패: {e.Message}");
-            // 실패 시 기본값 사용
-            if (resultTitleText != null)
+            yield return StartCoroutine(GenerateAITitleCoroutine(survived, (title) =>
             {
-                resultTitleText.text = survived ? "임무 완수" : "임무 실패";
-                resultTitleText.color = survived ? Color.green : Color.red;
-            }
-            if (summaryText != null)
+                if (!string.IsNullOrEmpty(title))
+                {
+                    resultTitleText.text = title;
+                    resultTitleText.color = survived ? Color.green : Color.red;
+                    titleGenerated = true;
+                }
+            }));
+        }
+
+        // 요약 생성
+        if (summaryText != null)
+        {
+            yield return StartCoroutine(GenerateAISummaryCoroutine(survived, (summary) =>
             {
-                summaryText.text = GenerateDetailedSummary(survived);
-            }
+                if (!string.IsNullOrEmpty(summary))
+                {
+                    summaryText.text = summary;
+                    summaryGenerated = true;
+                }
+            }));
+        }
+
+        // 생성 실패 시 기본값 사용
+        if (!titleGenerated && resultTitleText != null)
+        {
+            resultTitleText.text = survived ? "임무 완수" : "임무 실패";
+            resultTitleText.color = survived ? Color.green : Color.red;
+        }
+
+        if (!summaryGenerated && summaryText != null)
+        {
+            summaryText.text = GenerateDetailedSummary(survived);
         }
 
         // 로딩 패널 숨김
@@ -140,7 +150,7 @@ public class ResultSceneUI : MonoBehaviour
     /// <summary>
     /// AI를 통해 제목 생성
     /// </summary>
-    private async Task<string> GenerateAITitle(bool survived)
+    private IEnumerator GenerateAITitleCoroutine(bool survived, System.Action<string> callback)
     {
         int stability = _finalGameState.stability.stability;
         int turnsPlayed = 14 - _finalGameState.turnsRemaining;
@@ -175,14 +185,16 @@ public class ResultSceneUI : MonoBehaviour
 - 한글로 작성
 - 제목만 출력 (설명이나 부연 설명 금지)";
 
-        var response = await _flashModel.GenerateContentAsync(prompt);
-        return response.Text.Trim();
+        yield return StartCoroutine(CallGeminiAPI(prompt, (text) =>
+        {
+            callback?.Invoke(text?.Trim());
+        }));
     }
 
     /// <summary>
     /// AI를 통해 최종 결산 요약 생성
     /// </summary>
-    private async Task<string> GenerateAISummary(bool survived)
+    private IEnumerator GenerateAISummaryCoroutine(bool survived, System.Action<string> callback)
     {
         int stability = _finalGameState.stability.stability;
         int turnsPlayed = 14 - _finalGameState.turnsRemaining;
@@ -231,8 +243,85 @@ public class ResultSceneUI : MonoBehaviour
 - 한글로 작성
 - 과도한 문학적 수사 지양, 명확하고 간결하게";
 
-        var response = await _flashModel.GenerateContentAsync(prompt);
-        return response.Text.Trim();
+        yield return StartCoroutine(CallGeminiAPI(prompt, (text) =>
+        {
+            callback?.Invoke(text?.Trim());
+        }));
+    }
+
+    /// <summary>
+    /// Gemini API 호출
+    /// </summary>
+    private IEnumerator CallGeminiAPI(string prompt, System.Action<string> callback)
+    {
+        string url = $"{BaseUrl}{ModelName}:generateContent?key={apiKey.apiKey}";
+
+        // JSON 문자열 이스케이프 처리
+        string escapedPrompt = EscapeJsonString(prompt);
+        string jsonBody = $"{{\"contents\":[{{\"parts\":[{{\"text\":\"{escapedPrompt}\"}}]}}]}}";
+
+        using (UnityWebRequest request = new UnityWebRequest(url, "POST"))
+        {
+            byte[] bodyRaw = Encoding.UTF8.GetBytes(jsonBody);
+            request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+            request.downloadHandler = new DownloadHandlerBuffer();
+            request.SetRequestHeader("Content-Type", "application/json");
+
+            yield return request.SendWebRequest();
+
+            if (request.result != UnityWebRequest.Result.Success)
+            {
+                Debug.LogError($"API 호출 실패: {request.error}");
+                callback?.Invoke(null);
+            }
+            else
+            {
+                string rawResponse = request.downloadHandler.text;
+                string extractedText = ExtractTextFromApiResponse(rawResponse);
+                callback?.Invoke(extractedText);
+            }
+        }
+    }
+
+    /// <summary>
+    /// API 응답에서 텍스트 추출
+    /// </summary>
+    private string ExtractTextFromApiResponse(string apiResponse)
+    {
+        try
+        {
+            // GeminiManager에 정의된 DTO(GeminiApiResponse)를 사용하여 안전하게 파싱
+            GeminiApiResponse response = JsonUtility.FromJson<GeminiApiResponse>(apiResponse);
+
+            if (response != null && 
+                response.candidates != null && response.candidates.Length > 0 &&
+                response.candidates[0].content != null && 
+                response.candidates[0].content.parts != null && response.candidates[0].content.parts.Length > 0)
+            {
+                return response.candidates[0].content.parts[0].text;
+            }
+
+            return null;
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"텍스트 추출 실패: {e.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// JSON 문자열 이스케이프
+    /// </summary>
+    private string EscapeJsonString(string str)
+    {
+        if (string.IsNullOrEmpty(str)) return str;
+        
+        return str.Replace("\\", "\\\\")
+                  .Replace("\"", "\\\"")
+                  .Replace("\n", "\\n")
+                  .Replace("\r", "\\r")
+                  .Replace("\t", "\\t");
     }
 
     /// <summary>

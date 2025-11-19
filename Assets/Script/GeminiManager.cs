@@ -1,6 +1,7 @@
 using UnityEngine;
-using GenerativeAI;
-using System.Threading.Tasks;
+using UnityEngine.Networking;
+using System.Collections;
+using System.Text;
 using UnityEngine.UI;
 using TMPro;
 
@@ -8,6 +9,9 @@ public class GeminiManager : MonoBehaviour
 {
     [Header("Gemini 설정")]
     [SerializeField] private GeminiApiKeySO apiKey;
+
+    private const string BaseUrl = "https://generativelanguage.googleapis.com/v1beta/models/";
+    private const string ModelName = "gemini-2.5-flash-lite";
 
     [Header("UI")]
     [Tooltip("현재 상황(내레이션) 표시용 텍스트")]
@@ -35,13 +39,12 @@ public class GeminiManager : MonoBehaviour
 
     // 간단한 게임 상태 구조체
     private GameState gameState;
-    private GenerativeModel flashModel;
     private bool _isProcessing = false; // API 처리 중 플래그
     private bool _isFirstTurn = true; // 첫 번째 턴 여부 (첫 턴은 상태 변화 없음)
 
     private const string SelectedThemeKey = "SelectedTheme";
 
-    private async void Start()
+    private void Start()
     {
         if (string.IsNullOrEmpty(apiKey.apiKey))
         {
@@ -62,9 +65,6 @@ public class GeminiManager : MonoBehaviour
         // 슬라이더 범위 초기화 (0~100)
         InitializeSliders();
 
-        // llm 모델 지정
-        flashModel = new GenerativeModel(apiKey.apiKey, "gemini-2.5-flash-lite");
-
         // 게임 시작 시 GameState 초기화
         InitGameState();
 
@@ -72,7 +72,7 @@ public class GeminiManager : MonoBehaviour
         UpdateStatsUI();
 
         // 첫 턴 실행
-        await RunTurnAsync();
+        StartCoroutine(RunTurnCoroutine());
     }
 
     private void InitGameState()
@@ -112,39 +112,39 @@ public class GeminiManager : MonoBehaviour
     }
 
     /// <summary>
-    /// 한 턴: Flash 한 번 호출로 상황 + 선택지를 JSON으로 받아 파싱
+    /// 한 턴: Gemini API 호출로 상황 + 선택지를 JSON으로 받아 파싱
     /// </summary>
-    public async Task RunTurnAsync()
+    private IEnumerator RunTurnCoroutine()
     {
         // 로딩 시작
         SetLoadingState(true);
 
-        try
+        // GeminiPromptBuilder로 통합 프롬프트 생성 (JSON 응답 기대)
+        string prompt = GeminiPromptBuilder.BuildUnifiedPrompt(gameState);
+
+        // Gemini API 호출
+        yield return StartCoroutine(CallGeminiAPI(prompt, (response) =>
         {
-            // GeminiPromptBuilder로 통합 프롬프트 생성 (JSON 응답 기대)
-            string prompt = GeminiPromptBuilder.BuildUnifiedPrompt(gameState);
-            var response = await flashModel.GenerateContentAsync(prompt);
-            string rawText = response.Text;
-
-            Debug.Log($"[Gemini Raw Response]\n{rawText}");
-
-            // JSON 파싱
-            GeminiResponse geminiResponse = ParseGeminiResponse(rawText);
-
-            if (geminiResponse == null)
+            if (response == null)
             {
-                throw new System.Exception("JSON 파싱 실패: 응답 형식이 올바르지 않습니다.");
+                Debug.LogError("API 응답이 null입니다.");
+                if (situationText != null)
+                {
+                    situationText.text = "오류가 발생했습니다.";
+                }
+                SetLoadingState(false);
+                return;
             }
 
             // UI 업데이트를 메인 스레드에서 확실히 실행
             UnityEngine.Debug.Log("[파싱 성공] UI 업데이트 시작...");
-            UpdateUI(geminiResponse);
+            UpdateUI(response);
             UpdateTurnsUI(); // 남은 턴 UI 업데이트
             
             // 첫 번째 턴이 아닐 때만 상태 업데이트 적용
             if (!_isFirstTurn)
             {
-                ApplyStateUpdate(geminiResponse); // 상태 업데이트 적용
+                ApplyStateUpdate(response); // 상태 업데이트 적용
             }
             else
             {
@@ -163,38 +163,142 @@ public class GeminiManager : MonoBehaviour
                 DisableChoiceButtons();
                 
                 // API를 통해 게임 오버 상황 설명 생성
-                await ShowGameOverMessage();
-                
-                // 잠시 대기 후 결산 씬으로
-                await System.Threading.Tasks.Task.Delay(3000);
-                GoToResultScene();
+                StartCoroutine(ShowGameOverMessageCoroutine());
                 return;
             }
+
+            // 로딩 종료
+            SetLoadingState(false);
+        }));
+    }
+
+    /// <summary>
+    /// Gemini API 호출 (UnityWebRequest 사용)
+    /// </summary>
+    private IEnumerator CallGeminiAPI(string prompt, System.Action<GeminiResponse> callback)
+    {
+        string url = $"{BaseUrl}{ModelName}:generateContent?key={apiKey.apiKey}";
+
+        // JSON 요청 본문 생성
+        string escapedPrompt = EscapeJsonString(prompt);
+        string jsonBody = $"{{\"contents\":[{{\"parts\":[{{\"text\":\"{escapedPrompt}\"}}]}}]}}";
+
+        using (UnityWebRequest request = new UnityWebRequest(url, "POST"))
+        {
+            byte[] bodyRaw = Encoding.UTF8.GetBytes(jsonBody);
+            request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+            request.downloadHandler = new DownloadHandlerBuffer();
+            request.SetRequestHeader("Content-Type", "application/json");
+
+            yield return request.SendWebRequest();
+
+            if (request.result != UnityWebRequest.Result.Success)
+            {
+                Debug.LogError($"API 호출 실패: {request.error}");
+                Debug.LogError($"응답 코드: {request.responseCode}");
+                
+                callback?.Invoke(null);
+            }
+            else
+            {
+                string rawResponse = request.downloadHandler.text;
+
+                // API 응답에서 텍스트 추출
+                string extractedText = ExtractTextFromApiResponse(rawResponse);
+                
+                if (string.IsNullOrEmpty(extractedText))
+                {
+                    Debug.LogError("API 응답에서 텍스트를 추출할 수 없습니다.");
+                    callback?.Invoke(null);
+                }
+                else
+                {
+                    // JSON 파싱
+                    GeminiResponse geminiResponse = ParseGeminiResponse(extractedText);
+                    callback?.Invoke(geminiResponse);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// API 응답에서 실제 텍스트 부분 추출
+    /// </summary>
+    private string ExtractTextFromApiResponse(string apiResponse)
+    {
+        try
+        {
+            // JsonUtility를 사용하여 안전하게 파싱
+            GeminiApiResponse response = JsonUtility.FromJson<GeminiApiResponse>(apiResponse);
+            
+            if (response != null && 
+                response.candidates != null && response.candidates.Length > 0 &&
+                response.candidates[0].content != null && 
+                response.candidates[0].content.parts != null && response.candidates[0].content.parts.Length > 0)
+            {
+                return response.candidates[0].content.parts[0].text;
+            }
+            
+            Debug.LogError("API 응답 구조가 예상과 다릅니다.");
+            return null;
         }
         catch (System.Exception e)
         {
-            Debug.LogError($"턴 진행 중 에러 발생: {e.Message}");
-            if (situationText != null)
+            Debug.LogError($"텍스트 추출 실패: {e.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// JSON 문자열 이스케이프 처리
+    /// </summary>
+    private string EscapeJsonString(string str)
+    {
+        if (string.IsNullOrEmpty(str)) return str;
+        
+        StringBuilder sb = new StringBuilder(str.Length + 100);
+        
+        foreach (char c in str)
+        {
+            switch (c)
             {
-                string userMessage = "오류가 발생했습니다.";
-                if (e.Message != null && e.Message.Contains("503"))
-                {
-                    userMessage = "서버가 잠시 과부하 상태입니다.\n잠시 후 다시 시도해 주세요.";
-                }
-                situationText.text = userMessage;
+                case '\\': sb.Append("\\\\"); break;
+                case '"': sb.Append("\\\""); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                case '\b': sb.Append("\\b"); break;
+                case '\f': sb.Append("\\f"); break;
+                default:
+                    // 제어 문자 처리
+                    if (c < 32)
+                    {
+                        sb.Append("\\u");
+                        sb.Append(((int)c).ToString("x4"));
+                    }
+                    else
+                    {
+                        sb.Append(c);
+                    }
+                    break;
             }
         }
-        finally
-        {
-            // 로딩 종료
-            SetLoadingState(false);
-        }
+        
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 한 턴 실행 (외부 호출용 - 기존 호환성 유지)
+    /// </summary>
+    public void RunTurnAsync()
+    {
+        StartCoroutine(RunTurnCoroutine());
     }
 
     /// <summary>
     /// 버튼 클릭 시 호출 (유니티 이벤트에서 index 0~3 전달)
     /// </summary>
-    public async void OnChoiceSelected(int index)
+    public void OnChoiceSelected(int index)
     {
         // 이미 처리 중이면 무시
         if (_isProcessing)
@@ -227,9 +331,7 @@ public class GeminiManager : MonoBehaviour
         {
             Debug.Log("안정성 0! 게임오버!");
             DisableChoiceButtons();
-            await ShowGameOverMessage();
-            await System.Threading.Tasks.Task.Delay(3000);
-            GoToResultScene();
+            StartCoroutine(ShowGameOverMessageCoroutine());
             return;
         }
 
@@ -242,94 +344,44 @@ public class GeminiManager : MonoBehaviour
         }
 
         // 다음 턴 진행
-        await RunTurnAsync();
+        StartCoroutine(RunTurnCoroutine());
     }
 
     /// <summary>
     /// 게임 오버 시 API를 통해 상황 설명 생성 및 표시
     /// </summary>
-    private async System.Threading.Tasks.Task ShowGameOverMessage()
+    private IEnumerator ShowGameOverMessageCoroutine()
     {
-        try
+        Debug.Log("게임 오버 메시지 생성 중...");
+
+        // 게임 오버 프롬프트 생성
+        string prompt = GeminiPromptBuilder.BuildGameOverPrompt(gameState);
+
+        // API 호출
+        yield return StartCoroutine(CallGeminiAPI(prompt, (response) =>
         {
-            Debug.Log("게임 오버 메시지 생성 중...");
-
-            // 게임 오버 프롬프트 생성
-            string prompt = GeminiPromptBuilder.BuildGameOverPrompt(gameState);
-
-            // API 호출
-            var responseAsync = flashModel.GenerateContentAsync(prompt);
-            var response = await responseAsync;
-            string rawText = response?.Text ?? "";
-
-            Debug.Log($"[게임 오버 응답] {rawText}");
-
-            // JSON 파싱
-            var gameOverResponse = ParseGameOverResponse(rawText);
-
-            // UI 업데이트
-            if (situationText != null && !string.IsNullOrEmpty(gameOverResponse.gameover_text))
+            if (response != null && !string.IsNullOrEmpty(response.situation_text))
             {
-                situationText.text = gameOverResponse.gameover_text;
-            }
-            else if (situationText != null)
-            {
-                situationText.text = "안정성이 바닥났습니다. 모든 것이 무너졌습니다...";
-            }
-        }
-        catch (System.Exception e)
-        {
-            Debug.LogError($"게임 오버 메시지 생성 실패: {e.Message}");
-            
-            // 기본 메시지 표시
-            if (situationText != null)
-            {
-                situationText.text = "안정성이 바닥났습니다. 모든 것이 무너졌습니다...";
-            }
-        }
-    }
-
-    private GameOverResponse ParseGameOverResponse(string rawText)
-    {
-        try
-        {
-            // 마크다운 코드블록 제거
-            string cleaned = rawText.Trim();
-            if (cleaned.StartsWith("```json"))
-            {
-                cleaned = cleaned.Substring("```json".Length);
-            }
-            else if (cleaned.StartsWith("```"))
-            {
-                cleaned = cleaned.Substring("```".Length);
-            }
-
-            if (cleaned.EndsWith("```"))
-            {
-                cleaned = cleaned.Substring(0, cleaned.Length - "```".Length);
-            }
-
-            cleaned = cleaned.Trim();
-
-            // JSON 파싱
-            var response = JsonUtility.FromJson<GameOverResponse>(cleaned);
-            
-            if (response != null && !string.IsNullOrEmpty(response.gameover_text))
-            {
-                Debug.Log($"✅ [게임 오버 파싱 성공] {response.gameover_text.Substring(0, Mathf.Min(50, response.gameover_text.Length))}...");
-                return response;
+                // 게임 오버 텍스트를 situation_text에서 가져옴
+                if (situationText != null)
+                {
+                    situationText.text = response.situation_text;
+                }
+                Debug.Log($"[게임 오버] {response.situation_text}");
             }
             else
             {
-                Debug.LogWarning("게임 오버 응답이 비어있습니다.");
-                return new GameOverResponse { gameover_text = "안정성이 바닥났습니다. 모든 것이 무너졌습니다..." };
+                // 기본 메시지 표시
+                if (situationText != null)
+                {
+                    situationText.text = "안정성이 바닥났습니다. 모든 것이 무너졌습니다...";
+                }
             }
-        }
-        catch (System.Exception e)
-        {
-            Debug.LogError($"게임 오버 응답 파싱 실패: {e.Message}\n원본:\n{rawText}");
-            return new GameOverResponse { gameover_text = "안정성이 바닥났습니다. 모든 것이 무너졌습니다..." };
-        }
+        }));
+
+        // 3초 대기 후 결산 씬으로
+        yield return new WaitForSeconds(3f);
+        GoToResultScene();
     }
 
     /// <summary>
@@ -593,8 +645,28 @@ public class StabilityUpdate
     public int stability;
 }
 
+// --- Gemini API Response Wrapper ---
+
 [System.Serializable]
-public class GameOverResponse
+public class GeminiApiResponse
 {
-    public string gameover_text;
+    public Candidate[] candidates;
+}
+
+[System.Serializable]
+public class Candidate
+{
+    public Content content;
+}
+
+[System.Serializable]
+public class Content
+{
+    public Part[] parts;
+}
+
+[System.Serializable]
+public class Part
+{
+    public string text;
 }
